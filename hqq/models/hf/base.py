@@ -29,6 +29,10 @@ class BaseHQQHFModel(BaseHQQModel):
         archs = config.architectures
         if len(archs) == 1 and ("CausalLM" in archs[0]):
             auto_class = transformers.AutoModelForCausalLM
+        elif len(archs) == 1 and ("Seq2SeqLM" in archs[0]):
+            auto_class = transformers.AutoModelForSeq2SeqLM
+        elif len(archs) == 1 and ("M2M100ForConditionalGeneration" in archs[0]):
+            auto_class = transformers.AutoModelForSeq2SeqLM
 
         with init_empty_weights():
             model = auto_class.from_config(config, **model_kwargs)

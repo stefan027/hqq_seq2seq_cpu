@@ -73,11 +73,16 @@ def get_all_children_from_model(model, ignore: list = []) -> list:
     return tags
 
 
+def get_decoder_nodes(model):
+    return [node for node in get_all_children_from_model(model) if "decoder" in node]
+
+
 # Get all linear tags available
-def get_linear_tags_from_model(model, ignore: list) -> list:
+def get_linear_tags_from_model(model, ignore: list, ignore_decoder:bool=False) -> list:
     linear_tags = set()
+    excl_decoder_nodes = set(get_decoder_nodes(model)) if ignore_decoder else set()
     for name, module in model.named_modules():
-        if (type(module) in _QUANT_LAYERS) and (name.split(".")[-1] not in ignore):
+        if (type(module) in _QUANT_LAYERS) and (name.split(".")[-1] not in ignore) and (name not in excl_decoder_nodes):
             linear_tags.add(name_to_linear_tag(name))
     return list(linear_tags)
 
@@ -159,14 +164,15 @@ class BasePatch:
     ############################################
     # These tags are used to specfiy parameters of the patching in patch_linearlayers()
     @classmethod
-    def set_auto_linear_tags(cls, model, ignore: list = _IGNORE_LINEAR) -> None:
+    def set_auto_linear_tags(cls, model, ignore: list = _IGNORE_LINEAR, ignore_decoder:bool=False) -> None:
         if hasattr(model, "linear_tags") is False:
             linear_tags = cls.get_linear_tags()
             model.linear_tags = (
                 linear_tags
                 if len(linear_tags) > 0
-                else get_linear_tags_from_model(model, ignore=ignore)
+                else get_linear_tags_from_model(model, ignore=ignore, ignore_decoder=ignore_decoder)
             )
+            print("Linear tags:", model.linear_tags)
             model.base_class = cls
 
     # Returns the current linear tags
@@ -252,9 +258,9 @@ class BaseHQQModel:
 
     # Set-up model with the necessary data
     @classmethod
-    def setup_model(cls, model):
+    def setup_model(cls, model, ignore_decoder:bool=False):
         cls.autoname_modules(model)
-        cls.set_auto_linear_tags(model)
+        cls.set_auto_linear_tags(model, ignore_decoder=ignore_decoder)
 
     # Main function to quantize a model. Basically goes through the linear layers specfied in the patching function and replaces them with HQQLinear
     @classmethod
@@ -264,6 +270,7 @@ class BaseHQQModel:
         quant_config: dict,
         compute_dtype: torch.dtype = float16,
         device: Union[str, list, dict] = "cuda",
+        ignore_decoder: bool = False
     ):
         # Check if the model was already quantized
         if getattr(model, "hqq_quantized", False):
@@ -271,7 +278,7 @@ class BaseHQQModel:
             return
 
         # Set linear tags automatically
-        cls.setup_model(model)
+        cls.setup_model(model, ignore_decoder=ignore_decoder)
 
         # Use the same quantization config for all linear layers. Use None to skip quantizing a specfic layer.
         if True in [(key in model.linear_tags) for key in quant_config.keys()]:
@@ -284,19 +291,51 @@ class BaseHQQModel:
 
         # Get list of all nodes in order
         all_nodes = get_all_children_from_model(model, [])  # ordered nodes
-        try:
-            # Extract block names: This is following Hugging Face models.
-            num_blocks = (
-                len(model.model.layers)
-                if hasattr(model, "model")
-                else len(model.layers)
-            )
-            all_blocks = ["model.layers." + str(i) for i in range(num_blocks)]
-        except Exception:
-            all_blocks = None
-            print(
-                "Default model structure not supported. Make sure you feed device as dictionary as {name_block: device}"
-            )
+
+        # Check if `model` has an encoder and/or decoder
+        has_encoder = hasattr(model, "encoder") or hasattr(model.model, "encoder")
+        has_decoder = hasattr(model, "decoder") or hasattr(model.model, "decoder")
+        enc_dec_model = has_encoder or has_decoder
+
+        if enc_dec_model:
+            try:
+                # Extract encoder block names: This is following Hugging Face models.
+                if has_encoder:
+                    num_encoder_blocks = (
+                        len(model.model.encoder.layers) if hasattr(model, "model") else len(model.encoder.layers)
+                    )
+                    encoder_blocks = ["model.encoder.layers." + str(i) for i in range(num_encoder_blocks)]
+                else:
+                    encoder_blocks = []
+
+                # Extract decoder block names: This is following Hugging Face models.
+                if has_decoder:
+                    num_decoder_blocks = (
+                        len(model.model.decoder.layers) if hasattr(model, "model") else len(model.decoder.layers)
+                    )
+                    decoder_blocks = ["model.decoder.layers." + str(i) for i in range(num_decoder_blocks)]
+                else:
+                    decoder_blocks = []
+                all_blocks = encoder_blocks + decoder_blocks
+            except Exception:
+                all_blocks = None
+                print(
+                    "Default model structure not supported. Make sure you feed device as dictionary as {name_block: device}"
+                )
+        else:
+            try:
+                # Extract block names: This is following Hugging Face models.
+                num_blocks = (
+                    len(model.model.layers)
+                    if hasattr(model, "model")
+                    else len(model.layers)
+                )
+                all_blocks = ["model.layers." + str(i) for i in range(num_blocks)]
+            except Exception:
+                all_blocks = None
+                print(
+                    "Default model structure not supported. Make sure you feed device as dictionary as {name_block: device}"
+                )
 
         if isinstance(
             device, dict
@@ -393,6 +432,142 @@ class BaseHQQModel:
         model.hqq_quantized = True
 
         return model
+    # @classmethod
+    # def quantize_model(
+    #     cls,
+    #     model,
+    #     quant_config: dict,
+    #     compute_dtype: torch.dtype = float16,
+    #     device: Union[str, list, dict] = "cuda",
+    # ):
+    #     # Check if the model was already quantized
+    #     if getattr(model, "hqq_quantized", False):
+    #         print("Model was already quantized")
+    #         return
+
+    #     # Set linear tags automatically
+    #     cls.setup_model(model)
+
+    #     # Use the same quantization config for all linear layers. Use None to skip quantizing a specfic layer.
+    #     if True in [(key in model.linear_tags) for key in quant_config.keys()]:
+    #         # If the user doesn't specify a key from get_linear_tags, the layer is not quantized via (key, None)
+    #         patch_params = {key: None for key in model.linear_tags}
+    #         patch_params.update(quant_config)
+    #     else:
+    #         # Same quant_config for all layers
+    #         patch_params = {k: quant_config for k in model.linear_tags}
+
+    #     # Get list of all nodes in order
+    #     all_nodes = get_all_children_from_model(model, [])  # ordered nodes
+    #     try:
+    #         # Extract block names: This is following Hugging Face models.
+    #         num_blocks = (
+    #             len(model.model.layers)
+    #             if hasattr(model, "model")
+    #             else len(model.layers)
+    #         )
+    #         all_blocks = ["model.layers." + str(i) for i in range(num_blocks)]
+    #     except Exception:
+    #         all_blocks = None
+    #         print(
+    #             "Default model structure not supported. Make sure you feed device as dictionary as {name_block: device}"
+    #         )
+
+    #     if isinstance(
+    #         device, dict
+    #     ):  # input as {module block name (str): device (str or torch.device)}
+    #         device_map = device
+    #         num_devices = len(set([device_map[k] for k in device_map]))
+    #         all_blocks = list(device_map.keys())
+
+    #     node_to_block = {}
+    #     for node in all_nodes:
+    #         res = [block for block in all_blocks if (block in node)]
+    #         node_to_block[node] = res[-1] if (len(res) > 0) else node
+
+    #     # Set device-map
+    #     if isinstance(device, str):  # single device as str
+    #         device_map = {k: device for k in all_blocks + all_nodes}
+    #         num_devices = 1
+
+    #     if isinstance(device, list):  # list of devices
+    #         num_devices = len(device)
+    #         device_map = {}
+    #         for node in all_nodes:
+    #             if ".layers" in node:
+    #                 break
+    #             device_map[node] = device[0]
+
+    #         for node in all_nodes[::-1]:
+    #             if ".layers" in node:
+    #                 break
+    #             device_map[node] = device[-1]
+
+    #         step, k = len(all_blocks) // num_devices, 0
+    #         for i in range(0, len(all_blocks), step):
+    #             for j in range(i, i + step):
+    #                 device_map[all_blocks[min(j, len(all_blocks) - 1)]] = device[
+    #                     min(k, num_devices - 1)
+    #                 ]
+    #             k += 1
+
+    #     # Map nodes to block devices
+    #     for node in all_nodes:
+    #         device_map[node] = device_map[node_to_block[node]]
+
+    #     # We replace the nn.Linear layers with HQQLinear
+    #     def _patch_linear(linear_layer, quant_config):
+    #         if type(linear_layer) is HQQLinear:
+    #             return linear_layer
+
+    #         current_device = device_map[linear_layer.name]
+
+    #         if quant_config is not None:
+    #             out_module = HQQLinear(
+    #                 linear_layer,
+    #                 quant_config,
+    #                 compute_dtype=compute_dtype,
+    #                 device=current_device,
+    #             )
+    #         else:
+    #             out_module = linear_layer.to(device=current_device, dtype=compute_dtype)
+
+    #         out_module.device = current_device
+    #         return out_module
+
+    #     def _patch_other(layer):
+    #         current_device = device_map[layer.name]
+    #         layer.device = current_device
+    #         return layer.to(device=current_device, dtype=compute_dtype)
+
+    #     cls.patch_model(model, _patch_other, _patch_linear, patch_params)
+
+    #     # Insert device switcher
+    #     if num_devices > 1:
+    #         core_model = model if hasattr(model, "layers") else model.model
+
+    #         # Make sure the input (first node) has the input in the right device during generation
+    #         input_node_child_name = all_nodes[0].split(".")[-1]
+    #         input_node = getattr(core_model, input_node_child_name)
+    #         input_node.device = device_map[all_nodes[0]]
+    #         input_node.forward_orig = input_node.forward
+    #         input_node.forward = partial(forward_device_hooked, input_node)
+    #         setattr(core_model, input_node_child_name, input_node)
+
+    #         # Make sure all inputs to the blocks are in the right device
+    #         for i in range(len(core_model.layers)):
+    #             core_model.layers[i].device = device_map[core_model.layers[i].name]
+    #             core_model.layers[i].forward_orig = core_model.layers[i].forward
+    #             core_model.layers[i].forward = partial(
+    #                 forward_device_hooked, core_model.layers[i]
+    #             )
+
+    #     # Set base class
+    #     model.base_class = cls
+
+    #     model.hqq_quantized = True
+
+    #     return model
 
     # Prepares model weights by iterating through modules. It might some parameters that are NOT modules like model.param1
     @classmethod
@@ -486,10 +661,13 @@ class BaseHQQModel:
         # load_state_dict() doesn't work with modules initialized with init_empty_weights(), so we need to do this manually
         @torch.no_grad()
         def _load_module(module, params=None):
-            if module.name not in weights:
+            new_module_name = "model."+module.name
+            # if module.name not in weights:
+            if module.name not in weights and new_module_name not in weights:
                 return module.to(device=device, dtype=compute_dtype, non_blocking=True)
 
-            state_dict = weights[module.name]
+            # state_dict = weights[module.name]
+            state_dict = weights[module.name] if module.name in weights else weights[new_module_name]
             if "W_q" in state_dict:
                 module = HQQLinear(
                     linear_layer=None,
@@ -510,8 +688,88 @@ class BaseHQQModel:
                             requires_grad=False,
                         ),
                     )
-
             return module
+
+        # Load modules
+        cls.patch_model(
+            model, _load_module, _load_module, {k: None for k in model.linear_tags}
+        )
+
+        # Load other weights that are not part of any module
+        cls.post_module_load(model, weights)
+
+        model.hqq_quantized = True
+
+        # Set base class
+        model.base_class = cls
+
+        # Add adapter
+        if adapter is not None:
+            try:
+                PeftUtils.load_lora_weights(model, filename=pjoin(save_dir, adapter))
+                PeftUtils.cast_lora_weights(model, dtype=compute_dtype)
+            except Exception as e:
+                print("Skipping adapter loading...", str(e))
+
+        return model
+    # @classmethod
+    # def from_quantized(
+    #     cls,
+    #     save_dir_or_hub,
+    #     compute_dtype: torch.dtype = float16,
+    #     device="cuda",
+    #     cache_dir: Union[str, None] = "",
+    #     adapter: str = None,
+    #     **kwargs,
+    # ):
+    #     # Get directory path
+    #     save_dir = cls.try_snapshot_download(save_dir_or_hub, cache_dir)
+
+    #     # Load model from config
+    #     model = cls.create_model(save_dir, kwargs)
+
+    #     # Track save directory
+    #     model.save_dir = save_dir
+
+    #     # Name the layers
+    #     cls.setup_model(model)
+
+    #     # Load weights
+    #     try:
+    #         weights = cls.load_weights(save_dir)
+    #     except Exception:
+    #         print("Failed to load the weights")
+    #         raise FileNotFoundError
+
+    #     # load_state_dict() doesn't work with modules initialized with init_empty_weights(), so we need to do this manually
+    #     @torch.no_grad()
+    #     def _load_module(module, params=None):
+    #         if module.name not in weights:
+    #             return module.to(device=device, dtype=compute_dtype, non_blocking=True)
+
+    #         state_dict = weights[module.name]
+    #         if "W_q" in state_dict:
+    #             module = HQQLinear(
+    #                 linear_layer=None,
+    #                 quant_config=None,
+    #                 compute_dtype=compute_dtype,
+    #                 device=device,
+    #             )
+    #             module.load_state_dict(state_dict)
+    #         else:
+    #             for key in state_dict:
+    #                 setattr(
+    #                     module,
+    #                     key,
+    #                     nn.Parameter(
+    #                         state_dict[key].to(
+    #                             device=device, dtype=compute_dtype, non_blocking=True
+    #                         ),
+    #                         requires_grad=False,
+    #                     ),
+    #                 )
+
+    #         return module
 
         # Load modules
         cls.patch_model(

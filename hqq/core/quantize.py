@@ -824,6 +824,12 @@ class HQQLinear(nn.Module):
             out += self.bias
         return out
 
+    def forward(self, x: Tensor) -> Tensor:
+        out = torch.matmul(x, self.dequantize().t())
+        if self.bias is not None:
+            out += self.bias
+        return out
+
     @torch.compile()
     def forward_pytorch_compile(self, x: Tensor) -> Tensor:
         return self.forward_pytorch(x)
